@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,7 +70,7 @@ func TestReplayPendingSubmissionsMarksSubmitted(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 
 	if submitCalls == 0 {
 		t.Fatalf("expected submitblock to be called at least once")
@@ -145,19 +147,19 @@ func TestReplayPendingSubmissionsFailureBackoff(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 1 {
 		t.Fatalf("expected 1 submit attempt, got %d", submitCalls)
 	}
 
 	// Immediate retry should be backed off.
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 1 {
 		t.Fatalf("expected backoff to skip retry, got %d calls", submitCalls)
 	}
 
 	time.Sleep(20 * time.Millisecond)
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 2 {
 		t.Fatalf("expected retry after backoff, got %d calls", submitCalls)
 	}
@@ -231,7 +233,7 @@ func TestReplayPendingSubmissionsInconclusiveResultRetries(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 1 {
 		t.Fatalf("expected 1 submit attempt, got %d", submitCalls)
 	}
@@ -244,13 +246,13 @@ func TestReplayPendingSubmissionsInconclusiveResultRetries(t *testing.T) {
 	}
 
 	// The result rejection participates in the same backoff as RPC failures.
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 1 {
 		t.Fatalf("expected immediate retry to be backed off, got %d calls", submitCalls)
 	}
 
 	time.Sleep(20 * time.Millisecond)
-	replayPendingSubmissions(ctx, rpc)
+	replayPendingSubmissions(ctx, rpc, nil)
 	if submitCalls != 2 {
 		t.Fatalf("expected retry after backoff, got %d calls", submitCalls)
 	}
@@ -293,7 +295,7 @@ func TestReplayPendingSubmissionsDuplicateMarksSubmitted(t *testing.T) {
 	defer server.Close()
 	rpc := &RPCClient{url: server.URL, client: server.Client(), lp: server.Client(), nextID: 1}
 
-	replayPendingSubmissions(context.Background(), rpc)
+	replayPendingSubmissions(context.Background(), rpc, nil)
 	if submitCalls != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", submitCalls)
 	}
@@ -335,7 +337,7 @@ func TestStartPendingSubmissionReplayerReplaysImmediately(t *testing.T) {
 	defer func() { pendingReplayInterval = previousInterval }()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	done, err := startPendingSubmissionReplayer(ctx, rpc)
+	done, err := startPendingSubmissionReplayer(ctx, rpc, nil)
 	if err != nil {
 		t.Fatalf("start pending replayer: %v", err)
 	}
@@ -375,7 +377,7 @@ func TestPendingSubmissionPeriodicReplayDoesNotReclaimLiveSubmittingRow(t *testi
 	pendingReplayInterval = 5 * time.Millisecond
 	defer func() { pendingReplayInterval = previousInterval }()
 	ctx, cancel := context.WithCancel(context.Background())
-	done, err := startPendingSubmissionReplayer(ctx, rpc)
+	done, err := startPendingSubmissionReplayer(ctx, rpc, nil)
 	if err != nil {
 		t.Fatalf("start pending replayer: %v", err)
 	}
@@ -404,5 +406,120 @@ func TestPendingSubmissionPeriodicReplayDoesNotReclaimLiveSubmittingRow(t *testi
 	}
 	if status != pendingSubmissionStatusSubmitting {
 		t.Fatalf("live row status = %q, want submitting", status)
+	}
+}
+
+// Exercise the gap between Core's acceptance and the SQLite commit, then force
+// duplicate delivery from both the periodic scanner and a live miner.
+func TestRecoveredAcceptancePublishesHistoryAndDiscordOnce(t *testing.T) {
+	db := openPendingSubmissionTestDB(t)
+	store, err := newWorkerListStore(filepath.Join(t.TempDir(), "subscriptions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const worker = "wallet-from-advertised-job.rig-1"
+	if err := store.Add("subscriber", worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDiscordLink("subscriber", "discord-user", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	status := &StatusServer{workerLists: store}
+	status.UpdateConfig(Config{DiscordServerID: "server", DiscordBotToken: "test", DiscordNotifyChannelID: "channel"})
+	notifier := &discordNotifier{s: status}
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			io.WriteString(w, `{"result":null,"error":null,"id":1}`)
+			return
+		}
+		io.WriteString(w, `{"result":"duplicate","error":null,"id":1}`)
+	}))
+	defer server.Close()
+	rpc := &RPCClient{url: server.URL, client: server.Client(), lp: server.Client(), nextID: 1}
+	mc := &MinerConn{id: "test", rpc: rpc, conn: nopConn{}, discordNotifier: notifier}
+	job := solvedBlockPersistenceTestJob()
+	hash := strings.Repeat("3", 64)
+	header := make([]byte, 80)
+	coinbase := solvedBlockPersistenceTestCoinbase(t, job)
+	if _, err := db.Exec(`CREATE TRIGGER fail_terminal_update BEFORE UPDATE ON pending_submissions
+        WHEN NEW.status='submitted' BEGIN SELECT RAISE(FAIL, 'forced commit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	runSolvedBlockPersistenceTest(mc, job, header, coinbase, hash)
+	if len(loadFoundBlocks("", 10)) != 0 || len(notifier.pingQueue) != 0 {
+		t.Fatal("uncommitted acceptance was published")
+	}
+	if _, err := db.Exec("DROP TRIGGER fail_terminal_update"); err != nil {
+		t.Fatal(err)
+	}
+	// Await the startup scan via its normal shutdown barrier.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done, err := startPendingSubmissionReplayer(ctx, rpc, notifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(loadFoundBlocks("", 10)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if len(notifier.pingQueue) != 2 {
+		t.Fatalf("first replay queued %d Discord messages, want announcement and subscriber ping", len(notifier.pingQueue))
+	}
+	// Even if an old spool or interrupted process presents the same block again,
+	// including a later live duplicate, the durable history owns the alert.
+	if _, err := db.Exec("UPDATE pending_submissions SET status='pending' WHERE submission_key=?", hash); err != nil {
+		t.Fatal(err)
+	}
+	replayPendingSubmissions(context.Background(), rpc, notifier)
+	runSolvedBlockPersistenceTest(mc, job, header, coinbase, hash)
+	blocks := loadFoundBlocks("", 10)
+	if len(blocks) != 1 || blocks[0].Hash != hash || blocks[0].Worker != worker || blocks[0].Height != job.Template.Height ||
+		blocks[0].ShareDiff != 1 || blocks[0].PoolFeeSats != job.Template.CoinbaseValue {
+		t.Fatalf("recovered history: %+v", blocks)
+	}
+	record := readLastFoundBlockRecord(t)
+	if record["job_id"] != job.JobID || record["payout_address"] != job.PayoutAddress {
+		t.Fatalf("job metadata: %+v", record)
+	}
+	var terminal string
+	if err := db.QueryRow("SELECT status FROM pending_submissions WHERE submission_key=?", hash).Scan(&terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal != "submitted" || calls.Load() != 4 {
+		t.Fatalf("terminal state %s, RPC calls %d", terminal, calls.Load())
+	}
+	if len(notifier.pingQueue) != 2 {
+		t.Fatalf("duplicate Discord messages: %+v", notifier.pingQueue)
+	}
+	announcement, ping := notifier.pingQueue[0], notifier.pingQueue[1]
+	if !announcement.MentionEveryone || len(announcement.Notices) != 1 ||
+		len(ping.LinesByUser["discord-user"]) != 1 || ping.LinesByUser["discord-user"][0] != announcement.Notices[0] ||
+		!strings.Contains(announcement.Notices[0], "Block found: height 840001") {
+		t.Fatalf("unexpected Discord messages: %+v", notifier.pingQueue)
+	}
+}
+
+func TestAcceptedSubmissionRecognizesLegacyHistory(t *testing.T) {
+	db := openPendingSubmissionTestDB(t)
+	header := make([]byte, 80)
+	hash := hex.EncodeToString(reverseBytes(doubleSHA256(header)))
+	rec := pendingSubmissionRecord{Height: 1, Worker: "worker", BlockHex: hex.EncodeToString(header), Status: "pending"}
+	if err := appendPendingSubmissionRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO found_blocks_log(created_at_unix,json) VALUES (1,json_object('hash',?,'height',1))`, strings.ToUpper(hash)); err != nil {
+		t.Fatal(err)
+	}
+	if err := completeAcceptedSubmission(rec.BlockHex, rec, nil); err != nil {
+		t.Fatal(err)
+	}
+	if blocks := loadFoundBlocks("", 10); len(blocks) != 1 || blocks[0].Hash != strings.ToUpper(hash) {
+		t.Fatalf("legacy history: %+v", blocks)
 	}
 }

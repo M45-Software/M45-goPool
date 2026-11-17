@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -342,5 +343,103 @@ func TestSnapshotWorkerDB_CreatesCopy(t *testing.T) {
 	defer os.Remove(snap)
 	if _, err := os.Stat(snap); err != nil {
 		t.Fatalf("snapshot missing: %v", err)
+	}
+}
+
+func TestBackupsRetryLocalAndCloudIndependently(t *testing.T) {
+	ctx := context.Background()
+	cfg := defaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.BackblazeBackupEnabled = false
+	cfg.BackblazeKeepLocalCopy = true
+	cfg.BackblazeForceEveryInterval = false
+	cfg.BackblazeBackupIntervalSeconds = 1
+	cfg.BackupSnapshotPath = filepath.Join(cfg.DataDir, "backups", "workers.bak")
+	dbPath := stateDBPathFromDataDir(cfg.DataDir)
+	setupTestStateDB(t, cfg.DataDir)
+	db := getSharedStateDB()
+	svc, err := newBackblazeBackupService(ctx, cfg, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advance := setBackblazeTestClock(svc, time.Unix(1_700_000_000, 0))
+	var uploads []int64
+	var failUpload bool
+	svc.uploadSnapshot = func(ctx context.Context, path, object string) error {
+		version, err := workerDBDataVersion(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uploads = append(uploads, version)
+		if failUpload {
+			return errors.New("temporary upload failure")
+		}
+		return nil
+	}
+	// Simulate the backup directory becoming unavailable. Restore its older
+	// snapshot before the next interval, as with a remounted backup volume.
+	svc.RunOnce(ctx, "startup", false)
+	localPath := svc.snapshotPath
+	backupDir := filepath.Dir(localPath)
+	offlineDir := backupDir + ".offline"
+	if err := os.Rename(backupDir, offlineDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupDir, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	original := svc.Snapshot()
+	if _, err := db.Exec(`INSERT INTO bans(worker,worker_hash,until_unix,updated_at_unix) VALUES ('one','one',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	advance(time.Second)
+	svc.RunOnce(ctx, "interval", false)
+	afterFailure := svc.Snapshot()
+	if original.LastSnapshotVersion == 0 || afterFailure.LastSnapshotVersion != original.LastSnapshotVersion || afterFailure.LastSnapshotAt != original.LastSnapshotAt ||
+		afterFailure.LastUploadVersion <= original.LastUploadVersion {
+		t.Fatalf("failed local copy: before=%+v after=%+v", original, afterFailure)
+	}
+	if err := os.Remove(backupDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(offlineDir, backupDir); err != nil {
+		t.Fatal(err)
+	}
+	advance(time.Second)
+	svc.RunOnce(ctx, "interval", false)
+	repaired := svc.Snapshot()
+	version, err := workerDBDataVersion(ctx, localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploads) != 2 || version != uploads[1] || repaired.LastSnapshotVersion != version ||
+		repaired.LastUploadAt != afterFailure.LastUploadAt {
+		t.Fatalf("local retry: uploads=%v file=%d status=%+v", uploads, version, repaired)
+	}
+	// Reverse the failure. A successful local copy should be reused on the
+	// cloud retry, without taking another snapshot of an unchanged database.
+	failUpload = true
+	if _, err := db.Exec("DELETE FROM bans WHERE worker='one'"); err != nil {
+		t.Fatal(err)
+	}
+	advance(time.Second)
+	svc.RunOnce(ctx, "interval", false)
+	afterCloudFailure := svc.Snapshot()
+	if afterCloudFailure.LastSnapshotVersion <= version || afterCloudFailure.LastUploadVersion != version {
+		t.Fatalf("failed upload: %+v", afterCloudFailure)
+	}
+	failUpload = false
+	advance(time.Second)
+	svc.RunOnce(ctx, "interval", false)
+	final := svc.Snapshot()
+	if len(uploads) != 4 || uploads[2] != uploads[3] || final.LastUploadVersion != uploads[3] ||
+		final.LastSnapshotAt != afterCloudFailure.LastSnapshotAt {
+		t.Fatalf("cloud retry: uploads=%v status=%+v", uploads, final)
+	}
+	for key, want := range map[string]time.Time{backupStateKeyWorkerDBSnapshot: final.LastSnapshotAt, backupStateKeyWorkerDBUpload: final.LastUploadAt} {
+		stamp, version, err := readLastBackupStampFromDB(db, key)
+		if err != nil || !stamp.Equal(want) || version != final.LastSnapshotVersion {
+			t.Fatalf("stored %s stamp=%v version=%d err=%v", key, stamp, version, err)
+		}
 	}
 }

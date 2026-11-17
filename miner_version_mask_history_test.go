@@ -404,7 +404,6 @@ func TestHistoricalVersionMaskRescuesBlockAcrossReorg(t *testing.T) {
 			}
 
 			mc.processSubmissionTask(task)
-			flushFoundBlockLog(t)
 			if got := rpc.submitCalls.Load(); got != 1 {
 				t.Fatalf("submitblock calls = %d, want 1", got)
 			}

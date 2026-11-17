@@ -388,7 +388,7 @@ func run() (exitCode int) {
 	} else if svc != nil {
 		backupSvc = svc
 		if svc.b2Enabled {
-			if svc.bucket == nil {
+			if svc.uploadSnapshot == nil {
 				logger.Warn("backblaze backups enabled but bucket is not reachable; using local snapshots only",
 					"bucket", cfg.BackblazeBucket,
 					"interval", svc.interval.String(),
@@ -422,14 +422,6 @@ func run() (exitCode int) {
 	}
 	rpcClient := NewRPCClient(cfg, metrics)
 	rpcClient.StartCookieWatcher(ctx)
-	// Recover and replay any blocks that failed submitblock while the node RPC
-	// was unavailable in previous runs. Startup cannot admit miners until stale
-	// in-flight rows are safely replayable.
-	pendingReplayDone, replayErr := startPendingSubmissionReplayer(ctx, rpcClient)
-	if replayErr != nil {
-		logger.Error("pending block startup recovery interrupted", "component", "startup", "kind", "block_recovery", "error", replayErr)
-		return 1
-	}
 
 	accounting, err := NewAccountStore(cfg, debugEnabled(), cleanBansOnStartup)
 	if err != nil {
@@ -474,6 +466,15 @@ func run() (exitCode int) {
 	// changing how callers issue RPCs.
 	rpcClient.SetResultHook(statusServer.handleRPCResult)
 	notifier := &discordNotifier{s: statusServer}
+	// Recover and replay any blocks that failed submitblock while the node RPC
+	// was unavailable in previous runs. Startup cannot admit miners until stale
+	// in-flight rows are safely replayable.
+	pendingReplayDone, replayErr := startPendingSubmissionReplayer(ctx, rpcClient, notifier)
+	if replayErr != nil {
+		logger.Error("pending block startup recovery interrupted", "component", "startup", "kind", "block_recovery", "error", replayErr)
+		return 1
+	}
+
 	if err := notifier.start(ctx); err != nil {
 		logger.Warn("discord notifier start failed", "error", err)
 	}
@@ -975,9 +976,6 @@ func run() (exitCode int) {
 	if pendingReplayDone != nil {
 		<-pendingReplayDone
 	}
-	// All miner and submission producers are stopped, so this barrier ensures
-	// accepted-block audit rows reach SQLite before checkpoint and close.
-	drainFoundBlockLogger()
 
 	if accounting != nil {
 		if err := accounting.Flush(); err != nil {

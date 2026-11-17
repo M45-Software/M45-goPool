@@ -1,0 +1,36 @@
+name: Bitcoin Core regtest
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  bitcoin-core-regtest:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.4'
+
+      - name: Install native dependencies and Bitcoin Core 28.1
+        working-directory: ${{ runner.temp }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev pkg-config
+          archive=bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          curl --fail --show-error --silent --location --retry 3 --output "$archive" "https://bitcoincore.org/bin/bitcoin-core-28.1/$archive"
+          echo "07f77afd326639145b9ba9562912b2ad2ccec47b8a305bd075b4f4cb127b7ed7  $archive" | sha256sum --check
+          tar -xzf "$archive" bitcoin-28.1/bin/bitcoind
+
+      - name: Verify Bitcoin Core accepts a goPool block
+        env:
+          GOPOOL_TEST_BITCOIN_CORE_REGTEST: '1'
+          GOPOOL_BITCOIND: ${{ runner.temp }}/bitcoin-28.1/bin/bitcoind
+        run: |
+          set -o pipefail
+          test_name=TestBitcoinCoreRegtestAcceptsGoPoolBlock
+          go test -count=1 -json -run "^$test_name$" . | tee "$RUNNER_TEMP/regtest.jsonl"
+          jq -es --arg test "$test_name" 'any(.[]; .Test == $test and .Action == "pass")' "$RUNNER_TEMP/regtest.jsonl"

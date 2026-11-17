@@ -289,7 +289,6 @@ func TestPreparedRetiredBlockSurvivesPruningAndIsSessionLocal(t *testing.T) {
 		t.Fatalf("assemble expected block: %v", err)
 	}
 	mc.processShare(task, ctx)
-	flushFoundBlockLog(t)
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls = %d, want one", got)
 	}

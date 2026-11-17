@@ -264,6 +264,10 @@ func ensureStateTables(db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
+	// NULL identifies rows written before replay retained job and payout details.
+	if _, err := db.Exec(`ALTER TABLE pending_submissions ADD COLUMN found_block_details TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS pending_submissions_status_idx ON pending_submissions (status)`); err != nil {
 		return err
 	}

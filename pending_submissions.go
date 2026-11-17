@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -14,15 +15,16 @@ import (
 // Older entries may omit Status; in that case, they are treated as "pending"
 // unless a newer record for the same hash marks them as "submitted".
 type pendingSubmissionRecord struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Height     int64     `json:"height"`
-	Hash       string    `json:"hash"`
-	Worker     string    `json:"worker"`
-	BlockHex   string    `json:"block_hex"`
-	RPCError   string    `json:"rpc_error,omitempty"`
-	RPCURL     string    `json:"rpc_url,omitempty"`
-	PayoutAddr string    `json:"payout_addr,omitempty"`
-	Status     string    `json:"status,omitempty"`
+	Timestamp  time.Time          `json:"timestamp"`
+	Height     int64              `json:"height"`
+	Hash       string             `json:"hash"`
+	Worker     string             `json:"worker"`
+	BlockHex   string             `json:"block_hex"`
+	RPCError   string             `json:"rpc_error,omitempty"`
+	RPCURL     string             `json:"rpc_url,omitempty"`
+	PayoutAddr string             `json:"payout_addr,omitempty"`
+	Status     string             `json:"status,omitempty"`
+	Details    *foundBlockDetails `json:"found_block_details,omitempty"`
 }
 
 const (
@@ -121,7 +123,7 @@ func (b *pendingReplayBackoffState) reset(key string) {
 // pending. On successful submitblock, it marks the row as "submitted" so
 // future scans skip that block. This is best-effort and does not guarantee
 // eventual submission, but provides a recovery path when the node RPC was down.
-func startPendingSubmissionReplayer(ctx context.Context, rpc *RPCClient) (<-chan struct{}, error) {
+func startPendingSubmissionReplayer(ctx context.Context, rpc *RPCClient, notifier *discordNotifier) (<-chan struct{}, error) {
 	if rpc == nil {
 		done := make(chan struct{})
 		close(done)
@@ -142,7 +144,7 @@ func startPendingSubmissionReplayer(ctx context.Context, rpc *RPCClient) (<-chan
 		defer close(done)
 		// Do not sacrifice a fixed ticker interval after safely reclaiming a
 		// block interrupted by the previous process.
-		replayPendingSubmissions(ctx, rpc)
+		replayPendingSubmissions(ctx, rpc, notifier)
 		interval := pendingReplayInterval
 		if interval <= 0 {
 			interval = 5 * time.Second
@@ -154,7 +156,7 @@ func startPendingSubmissionReplayer(ctx context.Context, rpc *RPCClient) (<-chan
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				replayPendingSubmissions(ctx, rpc)
+				replayPendingSubmissions(ctx, rpc, notifier)
 			}
 		}
 	}()
@@ -196,7 +198,7 @@ func retryPendingSubmissionStartupRecovery(ctx context.Context, retryDelay time.
 	}
 }
 
-func replayPendingSubmissions(ctx context.Context, rpc *RPCClient) {
+func replayPendingSubmissions(ctx context.Context, rpc *RPCClient, notifier *discordNotifier) {
 	// Use the shared state database connection
 	db := getSharedStateDB()
 	if db == nil {
@@ -205,7 +207,7 @@ func replayPendingSubmissions(ctx context.Context, rpc *RPCClient) {
 	}
 
 	rows, err := db.Query(`
-		SELECT submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status
+		SELECT submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status, found_block_details
 		FROM pending_submissions
 		WHERE LOWER(TRIM(COALESCE(status, ''))) IN ('', 'pending')
 	`)
@@ -222,18 +224,19 @@ func replayPendingSubmissions(ctx context.Context, rpc *RPCClient) {
 	var pending []rowRec
 	for rows.Next() {
 		var (
-			key      string
-			tsUnix   int64
-			height   int64
-			hash     sql.NullString
-			worker   sql.NullString
-			blockHex string
-			rpcError sql.NullString
-			rpcURL   sql.NullString
-			payout   sql.NullString
-			status   string
+			key         string
+			tsUnix      int64
+			height      int64
+			hash        sql.NullString
+			worker      sql.NullString
+			blockHex    string
+			rpcError    sql.NullString
+			rpcURL      sql.NullString
+			payout      sql.NullString
+			status      string
+			detailsJSON sql.NullString
 		)
-		if err := rows.Scan(&key, &tsUnix, &height, &hash, &worker, &blockHex, &rpcError, &rpcURL, &payout, &status); err != nil {
+		if err := rows.Scan(&key, &tsUnix, &height, &hash, &worker, &blockHex, &rpcError, &rpcURL, &payout, &status, &detailsJSON); err != nil {
 			continue
 		}
 		blockHex = strings.TrimSpace(blockHex)
@@ -249,6 +252,13 @@ func replayPendingSubmissions(ctx context.Context, rpc *RPCClient) {
 			RPCURL:     strings.TrimSpace(rpcURL.String),
 			PayoutAddr: strings.TrimSpace(payout.String),
 			Status:     strings.TrimSpace(status),
+		}
+		if detailsJSON.Valid {
+			// An unreadable optional audit field must never prevent submitblock.
+			if err := json.Unmarshal([]byte(detailsJSON.String), &rec.Details); err != nil {
+				logger.Warn("pending block audit details unavailable", "hash", rec.Hash, "error", err)
+				rec.Details = nil
+			}
 		}
 		if tsUnix > 0 {
 			rec.Timestamp = time.Unix(tsUnix, 0).UTC()
@@ -343,13 +353,11 @@ func replayPendingSubmissions(ctx context.Context, rpc *RPCClient) {
 			}
 			logger.Info("pending block submitted", "height", rec.Height, "hash", rec.Hash)
 			pendingReplayBackoff.reset(item.Key)
-			changed, updateErr := transitionPendingSubmissionStatus(item.Key, pendingSubmissionStatusSubmitting, pendingSubmissionStatusSubmitted, "")
-			attemptFinished = updateErr == nil && changed
-			if updateErr != nil {
-				logger.Warn("pending submission status update failed", "key", item.Key, "height", rec.Height, "hash", rec.Hash, "error", updateErr)
-			} else if !changed {
-				logger.Warn("pending submission status changed unexpectedly", "key", item.Key, "height", rec.Height, "hash", rec.Hash)
+			if err := completeAcceptedSubmission(item.Key, rec, notifier); err != nil {
+				logger.Warn("record replayed block", "height", rec.Height, "hash", rec.Hash, "error", err)
+				return
 			}
+			attemptFinished = true
 		}()
 	}
 }
@@ -377,6 +385,14 @@ func appendPendingSubmissionRecordCtx(ctx context.Context, rec pendingSubmission
 		ctx = context.Background()
 	}
 
+	return upsertPendingSubmission(ctx, db, rec)
+}
+
+type pendingSubmissionExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func upsertPendingSubmission(ctx context.Context, db pendingSubmissionExecer, rec pendingSubmissionRecord) error {
 	key := pendingSubmissionKey(rec)
 	if key == "" {
 		return fmt.Errorf("pending submission key is empty")
@@ -391,8 +407,8 @@ func appendPendingSubmissionRecordCtx(ctx context.Context, rec pendingSubmission
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO pending_submissions (
-			submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status, found_block_details
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(submission_key) DO UPDATE SET
 			timestamp_unix = excluded.timestamp_unix,
 			height = excluded.height,
@@ -402,9 +418,11 @@ func appendPendingSubmissionRecordCtx(ctx context.Context, rec pendingSubmission
 			rpc_error = excluded.rpc_error,
 			rpc_url = excluded.rpc_url,
 			payout_addr = excluded.payout_addr,
-			status = excluded.status
+			status = excluded.status,
+			found_block_details = excluded.found_block_details
+		WHERE LOWER(TRIM(pending_submissions.status)) != 'submitted'
 	`, key, unixOrZero(rec.Timestamp), rec.Height, strings.TrimSpace(rec.Hash), strings.TrimSpace(rec.Worker), blockHex,
-		strings.TrimSpace(rec.RPCError), strings.TrimSpace(rec.RPCURL), strings.TrimSpace(rec.PayoutAddr), status); err != nil {
+		strings.TrimSpace(rec.RPCError), strings.TrimSpace(rec.RPCURL), strings.TrimSpace(rec.PayoutAddr), status, rec.Details); err != nil {
 		logger.Warn("pending block sqlite upsert", "error", err)
 		return err
 	}

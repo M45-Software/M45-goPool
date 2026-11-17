@@ -320,11 +320,11 @@ func importPendingSubmissionSpoolRecord(rec pendingSubmissionRecord) error {
 	rec.Status = pendingSubmissionStatusPending
 	_, err := db.Exec(`
 		INSERT INTO pending_submissions (
-			submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			submission_key, timestamp_unix, height, hash, worker, block_hex, rpc_error, rpc_url, payout_addr, status, found_block_details
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(submission_key) DO NOTHING
 	`, key, unixOrZero(rec.Timestamp), rec.Height, strings.TrimSpace(rec.Hash), strings.TrimSpace(rec.Worker), rec.BlockHex,
-		strings.TrimSpace(rec.RPCError), strings.TrimSpace(rec.RPCURL), strings.TrimSpace(rec.PayoutAddr), rec.Status)
+		strings.TrimSpace(rec.RPCError), strings.TrimSpace(rec.RPCURL), strings.TrimSpace(rec.PayoutAddr), rec.Status, rec.Details)
 	if err != nil {
 		return err
 	}

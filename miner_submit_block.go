@@ -118,7 +118,7 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 	// back to pending. The SQLite attempt is bounded; on timeout or failure the
 	// exact block is fsynced to the emergency spool instead. Persistence is a
 	// recovery aid and must never prevent submission when storage is unavailable.
-	pendingRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, "", pendingSubmissionStatusSubmitting)
+	pendingRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, shareDiff)
 	pendingKey := pendingSubmissionKey(pendingRec)
 	persistCtx, cancelPersist := context.WithTimeout(context.Background(), solvedBlockPersistenceTimeout)
 	persistErr := appendPendingSubmissionRecordCtx(persistCtx, pendingRec)
@@ -171,7 +171,9 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 				logger.Warn("pending submission failure state update failed", "key", pendingKey, "height", job.Template.Height, "hash", hashHex, "changed", changed, "error", updateErr)
 				// Retry the durable write with the complete record in case the
 				// compare-and-transition failed for a transient database reason.
-				fallbackRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, err.Error(), pendingSubmissionStatusPending)
+				fallbackRec := pendingRec
+				fallbackRec.Status = pendingSubmissionStatusPending
+				fallbackRec.RPCError = err.Error()
 				if fallbackErr := appendPendingSubmissionRecord(fallbackRec); fallbackErr != nil {
 					logger.Warn("pending submission failure fallback write failed", "key", pendingKey, "height", job.Template.Height, "hash", hashHex, "error", fallbackErr)
 				} else {
@@ -189,11 +191,13 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 		// that the block was accepted; it only preserves the data needed for
 		// a later submitblock attempt.
 		if !pendingPersisted {
-			spoolRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, err.Error(), pendingSubmissionStatusPending)
+			spoolRec := pendingRec
+			spoolRec.Status = pendingSubmissionStatusPending
+			spoolRec.RPCError = err.Error()
 			if spoolErr := writePendingSubmissionSpool(mc.cfg.DataDir, spoolRec); spoolErr != nil {
 				logger.Error("failed block emergency spool update failed", "height", job.Template.Height, "hash", hashHex, "error", spoolErr)
 			}
-			if fallbackErr := mc.logPendingSubmission(job, workerName, hashHex, blockHex, err); fallbackErr == nil {
+			if fallbackErr := appendPendingSubmissionRecord(spoolRec); fallbackErr == nil {
 				if spoolErr := removePendingSubmissionSpool(mc.cfg.DataDir, blockHex); spoolErr != nil {
 					logger.Warn("failed block emergency spool cleanup failed", "height", job.Template.Height, "hash", hashHex, "error", spoolErr)
 				}
@@ -202,31 +206,16 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 		mc.writeResponse(StratumResponse{ID: reqID, Result: false, Error: newStratumError(stratumErrCodeInvalidRequest, err.Error())})
 		return
 	}
-	if pendingPersisted {
-		changed, updateErr := transitionPendingSubmissionStatus(pendingKey, pendingSubmissionStatusSubmitting, pendingSubmissionStatusSubmitted, "")
-		submissionFinished = updateErr == nil && changed
-		if updateErr != nil {
-			logger.Warn("pending submission success state update failed", "key", pendingKey, "height", job.Template.Height, "hash", hashHex, "error", updateErr)
-		} else if !changed {
-			logger.Warn("pending submission success state changed unexpectedly", "key", pendingKey, "height", job.Template.Height, "hash", hashHex)
-		}
-		if !submissionFinished {
-			fallbackRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, "", pendingSubmissionStatusSubmitted)
-			if fallbackErr := appendPendingSubmissionRecord(fallbackRec); fallbackErr != nil {
-				logger.Warn("pending submission success fallback write failed", "key", pendingKey, "height", job.Template.Height, "hash", hashHex, "error", fallbackErr)
-			} else {
-				submissionFinished = true
+	if err := completeAcceptedSubmission(pendingKey, pendingRec, mc.discordNotifier); err != nil {
+		// The durable row (or emergency spool) remains replayable if recording
+		// the acceptance failed. Bitcoin Core already accepted the block.
+		logger.Warn("record accepted block", "height", job.Template.Height, "hash", hashHex, "error", err)
+	} else {
+		submissionFinished = true
+		if !pendingPersisted {
+			if err := removePendingSubmissionSpool(mc.cfg.DataDir, blockHex); err != nil {
+				logger.Warn("accepted block emergency spool cleanup failed", "height", job.Template.Height, "hash", hashHex, "error", err)
 			}
-		}
-	}
-	if !pendingPersisted {
-		acceptedRec := mc.pendingSubmissionRecord(job, workerName, hashHex, blockHex, "", pendingSubmissionStatusSubmitted)
-		if acceptedPersistErr := appendPendingSubmissionRecord(acceptedRec); acceptedPersistErr != nil {
-			// Keep the pending spool until SQLite owns the exact accepted bytes.
-			// A startup duplicate submission is safe even across a side-chain reorg.
-			logger.Warn("accepted block sqlite fallback failed; retaining emergency spool", "height", job.Template.Height, "hash", hashHex, "error", acceptedPersistErr)
-		} else if spoolErr := removePendingSubmissionSpool(mc.cfg.DataDir, blockHex); spoolErr != nil {
-			logger.Warn("accepted block emergency spool cleanup failed", "height", job.Template.Height, "hash", hashHex, "error", spoolErr)
 		}
 	}
 	if mc.metrics != nil {
@@ -267,7 +256,6 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 	if logger.Enabled(logLevelInfo) {
 		stats = mc.snapshotStats()
 	}
-	mc.logFoundBlock(job, workerName, hashHex, shareDiff)
 	if logger.Enabled(logLevelInfo) {
 		logger.Info("block found",
 			"miner", mc.minerName(workerName),
@@ -310,21 +298,9 @@ func assembleSolvedBlock(job *Job, header, coinbase []byte) (string, error) {
 	return hex.EncodeToString(buf.Bytes()), nil
 }
 
-// logFoundBlock appends a JSON line describing a found block to a log file in
-// the data directory. This is purely for operator audit/debugging and is best
-// effort; failures are logged but do not affect pool operation.
-func (mc *MinerConn) logFoundBlock(job *Job, worker, hashHex string, shareDiff float64) {
-	dir := mc.cfg.DataDir
-	if dir == "" {
-		dir = defaultDataDir
-	}
-	workerName := mc.minerName(worker)
-	now := time.Now().UTC()
-	// Compute a simple view of the payout split used for this block. In
-	// dual-payout mode with a validated worker script, the coinbase uses a
-	// pool-fee + worker output; otherwise the entire reward is logically
-	// treated as a worker payout in single mode, or sent to the pool in
-	// dual-payout fallback cases.
+// Capture the payout and share metadata while the advertised job and worker
+// session are available. Recovery can then publish the same history record.
+func (mc *MinerConn) pendingSubmissionRecord(job *Job, worker, hashHex, blockHex string, shareDiff float64) pendingSubmissionRecord {
 	total := job.Template.CoinbaseValue
 	feePct, payoutAddress := mc.jobPayoutPolicy(job)
 	if feePct < 0 {
@@ -353,66 +329,22 @@ func (mc *MinerConn) logFoundBlock(job *Job, worker, hashHex string, shareDiff f
 		dualFallback = true
 	}
 
-	rec := map[string]any{
-		"timestamp":            now,
-		"height":               job.Template.Height,
-		"hash":                 hashHex,
-		"worker":               workerName,
-		"share_diff":           shareDiff,
-		"job_id":               job.JobID,
-		"payout_address":       payoutAddress,
-		"coinbase_value_sats":  total,
-		"pool_fee_sats":        poolFee,
-		"worker_payout_sats":   workerAmt,
-		"dual_payout_fallback": dualFallback,
-	}
-	data, err := fastJSONMarshal(rec)
-	if err != nil {
-		logger.Warn("found block log marshal", "error", err)
-		return
-	}
-	line := append(data, '\n')
-	select {
-	case foundBlockLogCh <- foundBlockLogEntry{Dir: dir, Line: line}:
-	default:
-		// If the queue is full, drop the log entry rather than blocking
-		// the submit path; this log is best-effort operator metadata.
-		logger.Warn("found block log queue full; dropping entry")
-	}
-
-	mc.notifyDiscordFoundBlock(workerName, job.Template.Height, hashHex, now)
-}
-
-func (mc *MinerConn) notifyDiscordFoundBlock(worker string, height int64, hashHex string, now time.Time) {
-	if mc == nil || mc.discordNotifier == nil {
-		return
-	}
-	mc.discordNotifier.NotifyFoundBlock(worker, height, hashHex, now)
-}
-
-// logPendingSubmission appends a JSON line describing a block that failed
-// submitblock to a log file in the data directory. This allows operators to
-// manually retry submission with bitcoin-cli or future tooling when the node
-// RPC is down or returns an error. It is best effort only.
-func (mc *MinerConn) logPendingSubmission(job *Job, worker, hashHex, blockHex string, submitErr error) error {
-	if job == nil || blockHex == "" {
-		return fmt.Errorf("pending submission is missing job or block")
-	}
-	rec := mc.pendingSubmissionRecord(job, worker, hashHex, blockHex, submitErr.Error(), pendingSubmissionStatusPending)
-	return appendPendingSubmissionRecord(rec)
-}
-
-func (mc *MinerConn) pendingSubmissionRecord(job *Job, worker, hashHex, blockHex, rpcError, status string) pendingSubmissionRecord {
-	_, payoutAddress := mc.jobPayoutPolicy(job)
 	return pendingSubmissionRecord{
 		Timestamp:  time.Now().UTC(),
 		Height:     job.Template.Height,
 		Hash:       hashHex,
 		Worker:     mc.minerName(worker),
 		BlockHex:   blockHex,
-		RPCError:   rpcError,
 		RPCURL:     mc.cfg.RPCURL,
 		PayoutAddr: payoutAddress,
-		Status:     status,
+		Status:     pendingSubmissionStatusSubmitting,
+		Details: &foundBlockDetails{
+			ShareDiff:     shareDiff,
+			JobID:         job.JobID,
+			CoinbaseValue: total,
+			PoolFee:       poolFee,
+			WorkerPayout:  workerAmt,
+			DualFallback:  dualFallback,
+		},
 	}
 }

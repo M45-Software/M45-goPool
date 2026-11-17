@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // setupTestStateDB initializes a test-specific shared state DB.
@@ -22,51 +21,31 @@ func setupTestStateDB(t *testing.T, dataDir string) {
 	t.Cleanup(cleanup)
 }
 
-func flushFoundBlockLogger(t *testing.T) {
+// Record the accepted submission and inspect the JSON consumed by the dashboard.
+func foundBlockLogForTest(t *testing.T, mc *MinerConn, job *Job, worker string, shareDiff float64) map[string]any {
 	t.Helper()
-	done := make(chan struct{})
-	select {
-	case foundBlockLogCh <- foundBlockLogEntry{Done: done}:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out sending found block flush marker")
+	rec := mc.pendingSubmissionRecord(job, worker, "deadbeef", "abcd", shareDiff)
+	if err := completeAcceptedSubmission(rec.Hash, rec, nil); err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for found block flush marker")
-	}
+	return readLastFoundBlockRecord(t)
 }
 
-// readLastFoundBlockRecord polls the sqlite state DB in dir and returns the
-// last JSON object written. It is used to verify logFoundBlock behaviour.
-func readLastFoundBlockRecord(t *testing.T, dir string) map[string]any {
+func readLastFoundBlockRecord(t *testing.T) map[string]any {
 	t.Helper()
-	flushFoundBlockLogger(t)
-	dbPath := stateDBPathFromDataDir(dir)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		db, err := openStateDB(dbPath)
-		if err == nil {
-			var rec map[string]any
-			var line string
-			if err := db.QueryRow("SELECT json FROM found_blocks_log ORDER BY id DESC LIMIT 1").Scan(&line); err == nil && line != "" {
-				_ = db.Close()
-				if err := json.Unmarshal([]byte(line), &rec); err != nil {
-					t.Fatalf("unmarshal found block record: %v", err)
-				}
-				return rec
-			}
-			_ = db.Close()
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for found block sqlite row in %s", dbPath)
-		}
-		time.Sleep(10 * time.Millisecond)
+	var line string
+	if err := getSharedStateDB().QueryRow("SELECT json FROM found_blocks_log ORDER BY id DESC LIMIT 1").Scan(&line); err != nil {
+		t.Fatal(err)
 	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(line), &record); err != nil {
+		t.Fatal(err)
+	}
+	return record
 }
 
 // TestLogFoundBlockFallback_NoWorkerScript verifies that when there is no
-// cached worker payout script, logFoundBlock treats the full reward as a
+// cached worker payout script, the history record treats the full reward as a
 // pool-only payout and sets dual_payout_fallback=true.
 func TestLogFoundBlockFallback_NoWorkerScript(t *testing.T) {
 	dir := t.TempDir()
@@ -88,9 +67,7 @@ func TestLogFoundBlockFallback_NoWorkerScript(t *testing.T) {
 	}
 	mc := &MinerConn{cfg: cfg}
 
-	mc.logFoundBlock(job, "worker1", "deadbeef", 1.0)
-
-	rec := readLastFoundBlockRecord(t, dir)
+	rec := foundBlockLogForTest(t, mc, job, "worker1", 1.0)
 
 	total := int64(rec["coinbase_value_sats"].(float64))
 	poolFee := int64(rec["pool_fee_sats"].(float64))
@@ -112,7 +89,7 @@ func TestLogFoundBlockFallback_NoWorkerScript(t *testing.T) {
 }
 
 // TestLogFoundBlockFallback_SameWorkerAddress verifies that when the worker
-// address matches the pool payout address, logFoundBlock treats the reward as
+// address matches the pool payout address, the history record treats the reward as
 // pool-only and sets dual_payout_fallback=true even when a worker payout
 // script is cached.
 func TestLogFoundBlockFallback_SameWorkerAddress(t *testing.T) {
@@ -146,9 +123,7 @@ func TestLogFoundBlockFallback_SameWorkerAddress(t *testing.T) {
 	mc.setWorkerWallet(addr, addr, script)
 	job.PayoutScript = script
 
-	mc.logFoundBlock(job, addr, "deadbeef", 1.0)
-
-	rec := readLastFoundBlockRecord(t, dir)
+	rec := foundBlockLogForTest(t, mc, job, addr, 1.0)
 
 	total := int64(rec["coinbase_value_sats"].(float64))
 	poolFee := int64(rec["pool_fee_sats"].(float64))
@@ -194,8 +169,7 @@ func TestLogFoundBlockCaseFoldedLabelsUseDistinctScripts(t *testing.T) {
 	}}
 	mc.setWorkerWallet(workerLabel, workerLabel, workerScript)
 
-	mc.logFoundBlock(job, workerLabel, "deadbeef", 1)
-	rec := readLastFoundBlockRecord(t, dir)
+	rec := foundBlockLogForTest(t, mc, job, workerLabel, 1)
 	fallback, ok := rec["dual_payout_fallback"].(bool)
 	if !ok {
 		t.Fatal("dual_payout_fallback missing or not bool")
@@ -213,7 +187,7 @@ func TestLogFoundBlockCaseFoldedLabelsUseDistinctScripts(t *testing.T) {
 
 // TestLogFoundBlock_NoFallbackDifferentAddress verifies that when the worker
 // address differs from the pool payout address and a worker payout script is
-// cached, logFoundBlock records a pool/worker split based on PoolFeePercent
+// cached, the history record shows a pool/worker split based on PoolFeePercent
 // and dual_payout_fallback=false.
 func TestLogFoundBlock_NoFallbackDifferentAddress(t *testing.T) {
 	dir := t.TempDir()
@@ -244,9 +218,7 @@ func TestLogFoundBlock_NoFallbackDifferentAddress(t *testing.T) {
 	}
 	mc.setWorkerWallet(workerAddr, workerAddr, script)
 
-	mc.logFoundBlock(job, workerAddr, "deadbeef", 1.0)
-
-	rec := readLastFoundBlockRecord(t, dir)
+	rec := foundBlockLogForTest(t, mc, job, workerAddr, 1.0)
 
 	total := int64(rec["coinbase_value_sats"].(float64))
 	poolFee := int64(rec["pool_fee_sats"].(float64))

@@ -187,7 +187,7 @@
       <li><strong>bans:</strong> <code>worker</code>, <code>worker_hash</code>, <code>until_unix</code>, <code>reason</code>, <code>updated_at_unix</code>.</li>
       <li><strong>best_shares:</strong> <code>position</code>, <code>worker</code>, <code>difficulty</code>, <code>timestamp_unix</code>, <code>hash</code>.</li>
       <li><strong>found_blocks_log:</strong> <code>id</code>, <code>created_at_unix</code>, <code>json</code> (serialized found-block event data).</li>
-      <li><strong>pending_submissions:</strong> <code>submission_key</code>, <code>timestamp_unix</code>, <code>height</code>, <code>hash</code>, <code>worker</code>, <code>block_hex</code>, <code>rpc_error</code>, <code>rpc_url</code>, <code>payout_addr</code>, <code>status</code>.</li>
+      <li><strong>pending_submissions:</strong> <code>submission_key</code>, <code>timestamp_unix</code>, <code>height</code>, <code>hash</code>, <code>worker</code>, <code>block_hex</code>, <code>rpc_error</code>, <code>rpc_url</code>, <code>payout_addr</code>, <code>status</code>, <code>found_block_details</code> (job ID, share difficulty, and payout breakdown used for block history).</li>
       <li><strong>backup_state and db_change_state:</strong> operational metadata used for backup and cache/version invalidation.</li>
     </ul>
 

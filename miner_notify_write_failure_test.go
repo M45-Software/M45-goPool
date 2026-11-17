@@ -232,7 +232,6 @@ func TestCapturedBlockTaskStillSubmitsAfterWriteClosure(t *testing.T) {
 	}
 
 	mc.processSubmissionTask(task)
-	flushFoundBlockLog(t)
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("captured block submit calls after closure = %d, want 1", got)
 	}

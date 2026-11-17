@@ -56,21 +56,6 @@ func (r *rejectingSubmitRPC) callCtx(_ context.Context, method string, _ any, ou
 	}
 }
 
-func flushFoundBlockLog(t *testing.T) {
-	t.Helper()
-	done := make(chan struct{})
-	select {
-	case foundBlockLogCh <- foundBlockLogEntry{Done: done}:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatalf("timed out enqueueing found block log flush")
-	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for found block log flush")
-	}
-}
-
 func TestSubmitBlockResultStringIsRejection(t *testing.T) {
 	rpc := &rejectingSubmitRPC{result: "bad-cb-amount"}
 	mc := &MinerConn{
@@ -132,7 +117,6 @@ func TestWinningBlockNotRejectedAsDuplicate(t *testing.T) {
 	}
 	mc.conn = nopConn{}
 	mc.processSubmissionTask(task)
-	flushFoundBlockLog(t)
 
 	rpc := mc.rpc.(*countingSubmitRPC)
 	if got := rpc.submitCalls.Load(); got != 1 {
@@ -268,7 +252,6 @@ func TestWinningBlockUsesNotifiedScriptTime(t *testing.T) {
 
 	mc.conn = nopConn{}
 	mc.processSubmissionTask(task)
-	flushFoundBlockLog(t)
 
 	rpc := mc.rpc.(*countingSubmitRPC)
 	if got := rpc.submitCalls.Load(); got != 1 {
@@ -327,7 +310,6 @@ func TestBlockBypassesPolicyRejects(t *testing.T) {
 
 	mc.conn = nopConn{}
 	mc.processSubmissionTask(task)
-	flushFoundBlockLog(t)
 
 	rpc := mc.rpc.(*countingSubmitRPC)
 	if got := rpc.submitCalls.Load(); got != 1 {
@@ -369,7 +351,6 @@ func TestBannedMinerBlockBypassesBanPolicy(t *testing.T) {
 	}
 
 	mc.processSubmissionTask(task)
-	flushFoundBlockLog(t)
 
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", got)
@@ -553,7 +534,6 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 		// attribution must remain bound to A.
 		Params: []any{workerB, stratumJobID, en2Hex, ntimeHex, nonceHex},
 	})
-	flushFoundBlockLog(t)
 
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("expected submitblock to be called once, got %d", got)
@@ -581,7 +561,7 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 	if got := mc.currentWorker(); got != workerB {
 		t.Fatalf("late wallet A block changed current worker to %q, want wallet B %q", got, workerB)
 	}
-	found := readLastFoundBlockRecord(t, mc.cfg.DataDir)
+	found := readLastFoundBlockRecord(t)
 	if got, _ := found["worker"].(string); got != workerA {
 		t.Fatalf("found block worker = %q, want advertised wallet A %q", got, workerA)
 	}

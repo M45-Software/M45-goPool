@@ -125,7 +125,6 @@ func TestRuntimeConfigKeepsActiveSessionAndAdaptsNewJobs(t *testing.T) {
 	mc.handleSubmit(&StratumRequest{ID: 1, Method: "mining.submit", Params: []any{
 		mc.currentWorker(), jobID, en2Hex, params[7].(string), "00000000",
 	}})
-	flushFoundBlockLog(t)
 	rpc := mc.rpc.(*countingSubmitRPC)
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", got)

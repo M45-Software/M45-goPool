@@ -44,7 +44,6 @@ func TestSaturatedSubmissionQueueBlockBypassesOrdinaryFIFO(t *testing.T) {
 	makeQueuePriorityJobABlock(job)
 
 	mc.handleSubmit(testSubmitRequestForJob(job, mc.currentWorker()))
-	flushFoundBlockLog(t)
 
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", got)
@@ -75,7 +74,6 @@ func TestSaturatedQueueShedsNonBlockThenAcceptsLaterBlock(t *testing.T) {
 	second.ID = 2
 	second.Params[4] = "00000002"
 	mc.handleSubmit(second)
-	flushFoundBlockLog(t)
 
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls after later block = %d, want 1", got)
@@ -162,7 +160,6 @@ func TestSaturatedQueueRescueVersionBlockBypassesOrdinaryFIFO(t *testing.T) {
 		},
 	}
 	mc.handleSubmit(req)
-	flushFoundBlockLog(t)
 
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", got)

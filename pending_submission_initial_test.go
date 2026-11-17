@@ -166,7 +166,7 @@ func TestSolvedBlockPersistedBeforeRPCAndNotReplayedConcurrently(t *testing.T) {
 
 	// A periodic scan while the initial RPC is in flight must not submit the
 	// same durable row a second time.
-	replayPendingSubmissions(context.Background(), rpc)
+	replayPendingSubmissions(context.Background(), rpc, nil)
 	if calls := submitCalls.Load(); calls != 1 {
 		t.Fatalf("submitblock calls while initial submission active = %d, want 1", calls)
 	}
@@ -176,7 +176,6 @@ func TestSolvedBlockPersistedBeforeRPCAndNotReplayedConcurrently(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("initial block submission did not finish")
 	}
-	flushFoundBlockLog(t)
 
 	var status, storedBlock string
 	if err := db.QueryRow(`SELECT status, block_hex FROM pending_submissions WHERE submission_key = ?`, hash).Scan(&status, &storedBlock); err != nil {
@@ -260,7 +259,6 @@ func TestSolvedBlockSQLiteContentionSpoolsBeforeRPC(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("solved block path did not finish after releasing database contention")
 	}
-	flushFoundBlockLog(t)
 	if calls := submitCalls.Load(); calls != 1 {
 		t.Fatalf("submitblock calls = %d, want 1", calls)
 	}
@@ -359,7 +357,6 @@ func TestSolvedBlockSubmissionContinuesWhenPersistenceFails(t *testing.T) {
 	hash := strings.Repeat("3", 64)
 	mc := &MinerConn{id: "persistence-failure", conn: nopConn{}, rpc: rpc, cfg: Config{RPCURL: server.URL, DataDir: dataDir}}
 	runSolvedBlockPersistenceTest(mc, job, header, coinbase, hash)
-	flushFoundBlockLog(t)
 	if calls := submitCalls.Load(); calls != 1 {
 		t.Fatalf("submitblock calls after persistence failure = %d, want 1", calls)
 	}
@@ -749,7 +746,7 @@ func TestPendingSubmissionReplayTreatsLegacyEmptyStatusAsPending(t *testing.T) {
 	defer server.Close()
 	rpc := &RPCClient{url: server.URL, client: server.Client(), lp: server.Client(), nextID: 1}
 
-	replayPendingSubmissions(context.Background(), rpc)
+	replayPendingSubmissions(context.Background(), rpc, nil)
 	if calls := submitCalls.Load(); calls != 1 {
 		t.Fatalf("legacy empty-status submitblock calls = %d, want 1", calls)
 	}

@@ -53,7 +53,8 @@ go test -run TestBitcoinCoreRegtestAcceptsGoPoolBlock -v
 
 `bitcoind` must be in `PATH`, or its path can be supplied with
 `GOPOOL_BITCOIND=/path/to/bitcoind`. The test is skipped during the normal
-`go test ./...` suite so unit tests do not depend on an external node.
+`go test ./...` suite so unit tests do not depend on an external node. Pull-request CI runs it
+separately with checksum-pinned Bitcoin Core 28.1 and requires an explicit pass.
 
 ## Test Categories
 

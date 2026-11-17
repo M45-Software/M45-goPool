@@ -223,13 +223,9 @@ func workerHasRecentShares(views []WorkerView, now time.Time, threshold time.Dur
 // NotifyFoundBlock pings any subscribed Discord users who have this worker
 // saved with notifications enabled.
 func (n *discordNotifier) NotifyFoundBlock(worker string, height int64, hashHex string, now time.Time) {
-	if n == nil || n.s == nil || n.dg == nil || n.s.workerLists == nil {
-		return
-	}
-	if !n.enabled() {
-		return
-	}
-	if strings.TrimSpace(n.notifyChannelID) == "" {
+	// Recovery may enqueue before the Discord gateway finishes connecting.
+	// The sender starts draining this queue once its session is ready.
+	if n == nil || n.s == nil || n.s.workerLists == nil || !n.enabled() {
 		return
 	}
 	worker = strings.TrimSpace(worker)
