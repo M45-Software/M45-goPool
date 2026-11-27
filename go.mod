@@ -3,7 +3,7 @@ module goPool
 go 1.26.11
 
 require (
-	github.com/Backblaze/blazer v0.9.0
+	github.com/Backblaze/blazer v0.10.1
 	github.com/btcsuite/btcd v0.27.0
 	github.com/btcsuite/btcd/address/v2 v2.0.1
 	github.com/btcsuite/btcd/btcec/v2 v2.5.1
@@ -14,7 +14,7 @@ require (
 	github.com/btcsuite/btcd/wire/v2 v2.0.2
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/bytedance/sonic v1.15.5
-	github.com/clerk/clerk-sdk-go/v2 v2.8.0
+	github.com/clerk/clerk-sdk-go/v2 v2.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/hako/durafmt v0.0.0-20210608085754-5c1018a4e16b
 	github.com/martinhoefling/goxkcdpwgen v0.1.1
@@ -23,7 +23,7 @@ require (
 	github.com/pelletier/go-toml v1.9.5
 	github.com/remeh/sizedwaitgroup v1.0.0
 	golang.org/x/sys v0.50.0
-	modernc.org/sqlite v1.62.0
+	modernc.org/sqlite v1.63.0
 )
 
 require (
